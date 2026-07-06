@@ -1,93 +1,82 @@
 import os
-import json
-import requests
+import re
+from typing import List, Dict
+from urllib.parse import quote_plus
 
+import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from tavily import TavilyClient
-from langchain.tools import tool
-
 
 load_dotenv()
 
-t = TavilyClient(
-    api_key=os.getenv("TAVILY_API_KEY")
-)
+try:
+    from tavily import TavilyClient
+except Exception:  # pragma: no cover - optional dependency
+    TavilyClient = None
 
 
-@tool
-def web_searching(query: str) -> str:
-    """
-    Perform a web search and give recent and reliable information.
-    Returns title, URL and snippet.
-    """
+def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """Search the web and return recent results with title, URL, and snippet."""
+    if TavilyClient and os.getenv("TAVILY_API_KEY"):
+        try:
+            client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+            response = client.search(query=query, max_results=max_results)
+            results = []
+            for item in response.get("results", []):
+                results.append(
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "snippet": item.get("content", ""),
+                    }
+                )
+            return results
+        except Exception:
+            pass
 
+    return _duckduckgo_search(query, max_results=max_results)
+
+
+def _duckduckgo_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        response = t.search(
-            query=query,
-            max_results=2
-        )
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException:
+        return []
 
-        out = []
+    soup = BeautifulSoup(response.text, "html.parser")
+    results: List[Dict[str, str]] = []
+    for item in soup.select(".result")[:max_results]:
+        title_tag = item.select_one(".result__title a")
+        snippet_tag = item.select_one(".result__snippet")
+        if not title_tag:
+            continue
 
-        for r in response["results"]:
-            out.append({
-                "title": r.get("title"),
-                "url": r.get("url"),
-                "snippet": r.get("content")
-            })
+        href = title_tag.get("href", "")
+        url = href if href.startswith("http") else f"https://duckduckgo.com{href}"
 
-        return json.dumps(
-            out,
-            indent=4
-        )
-
-    except Exception as e:
-        return f"Search error: {e}"
-
-
-
-@tool
-def url_scrape(url: str) -> str:
-    """
-    Scrape the content of a given URL.
-    Returns cleaned text content.
-    """
-
-    try:
-        response = requests.get(
-            url,
-            timeout=10,
-            headers={
-                "User-Agent": "Mozilla/5.0"
+        results.append(
+            {
+                "title": title_tag.get_text(" ", strip=True),
+                "url": url,
+                "snippet": snippet_tag.get_text(" ", strip=True) if snippet_tag else "",
             }
         )
 
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
+    return results
 
-        # remove unwanted sections
-        for tag in soup(
-            ["script", "style", "nav",
-             "footer", "header", "aside"]
-        ):
+
+def scrape_url(url: str, max_chars: int = 4000) -> str:
+    """Scrape and return clean text content from a given URL for deeper reading."""
+    try:
+        response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "noscript"]):
             tag.decompose()
-
-
-        text = soup.get_text(
-            separator="\n"
-        )
-
-        cleaned = "\n".join(
-            line.strip()
-            for line in text.splitlines()
-            if line.strip()
-        )
-
-        return cleaned[:5000]
-
-
-    except Exception as e:
-        return f"Error scraping URL: {e}"
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        return text[:max_chars]
+    except Exception as exc:
+        return f"Could not scrape URL: {str(exc)}"
